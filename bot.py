@@ -2,111 +2,157 @@ import logging
 import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
-from config import BOT_TOKEN, YOUR_USER_ID, CHANNELS
+from config import BOT_TOKEN, ADMIN_IDS, CHANNELS
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 
+async def check_admin(update: Update):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        if update.message:
+            await update.message.reply_text("❌ مش مصرح لك تستخدم البوت ده.")
+        elif update.callback_query:
+            await update.callback_query.answer("❌ مش مصرح لك.", show_alert=True)
+        return False
+    return True
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != YOUR_USER_ID:
-        return
+    if not await check_admin(update): return
     await update.message.reply_text(
-        "🤖 البوت شغال!\n\n"
-        "ابعت أي رسالة وهخيرك تنشرها في أي قناة، وبعدين هسألك للتأكيد.\n"
-        "يدعم: نصوص، صور، فيديوهات، ملفات، استيكرات، استطلاعات رأي، وكل حاجة تانية.\n\n"
-        "/channels - عشان تشوف القنوات المتصلة"
+        "🤖 أهلاً بك في نظام النشر الاحترافي!\n\n"
+        "ابعت أي رسالة (نص، صورة، فيديو، ملف، استطلاع رأي، إلخ..)\n"
+        "وهتظهر لك لوحة تحكم تختار منها القنوات اللي عايز تنشر فيها بكل سهولة.\n\n"
+        "/channels - عشان تشوف وتحدث القنوات المتصلة"
     )
 
+async def _get_channel_names(context: ContextTypes.DEFAULT_TYPE):
+    if "channel_names" not in context.bot_data:
+        context.bot_data["channel_names"] = {}
+    
+    for ch in CHANNELS:
+        if ch not in context.bot_data["channel_names"]:
+            try:
+                chat = await context.bot.get_chat(ch)
+                context.bot_data["channel_names"][ch] = chat.title
+            except Exception as e:
+                logging.error(f"Failed to get channel name for {ch}: {e}")
+                context.bot_data["channel_names"][ch] = f"قناة {ch}"
+    return context.bot_data["channel_names"]
+
 async def channels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != YOUR_USER_ID:
-        return
+    if not await check_admin(update): return
+    
     if not CHANNELS:
         await update.message.reply_text("❌ مفيش أي قنوات متصلة بالبوت حالياً.")
         return
         
-    text = "📢 القنوات المتصلة:\n\n"
+    await update.message.reply_text("جاري جلب أسماء القنوات... ⏳")
+    names = await _get_channel_names(context)
+    
+    text = "📢 القنوات المتصلة بنظام النشر:\n\n"
     for i, ch in enumerate(CHANNELS, 1):
-        text += f"{i}. `{ch}`\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
+        text += f"{i}. {names.get(ch, str(ch))}\n"
+    await update.message.reply_text(text)
+
+def _build_keyboard(context: ContextTypes.DEFAULT_TYPE):
+    selected = context.user_data.get('selected_channels', set())
+    names = context.bot_data.get('channel_names', {})
+    
+    keyboard = []
+    for ch in CHANNELS:
+        is_selected = ch in selected
+        mark = "✅" if is_selected else "❌"
+        ch_name = names.get(ch, f"قناة {ch}")
+        keyboard.append([InlineKeyboardButton(f"{mark} {ch_name}", callback_data=f"toggle_{ch}")])
+    
+    # Control buttons
+    controls = []
+    if len(selected) < len(CHANNELS):
+        controls.append(InlineKeyboardButton("✅ تحديد الكل", callback_data="select_all"))
+    if len(selected) > 0:
+        controls.append(InlineKeyboardButton("❌ إلغاء تحديد الكل", callback_data="deselect_all"))
+    
+    if controls:
+        keyboard.append(controls)
+        
+    if len(selected) > 0:
+        keyboard.append([InlineKeyboardButton(f"🚀 إرسال للقنوات المحددة ({len(selected)})", callback_data="confirm_post")])
+        
+    keyboard.append([InlineKeyboardButton("🗑️ إلغاء العملية", callback_data="cancel")])
+    
+    return InlineKeyboardMarkup(keyboard)
 
 async def receive_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != YOUR_USER_ID:
-        await update.message.reply_text("❌ مش مصرح لك.")
-        return
+    if not await check_admin(update): return
 
     if not CHANNELS:
         await update.message.reply_text("❌ مفيش قنوات متصلة عشان أنشر فيها. ضيف قنوات في ملف الإعدادات الأول.")
         return
 
-    # Store the message details
+    # Ensure names are cached
+    await _get_channel_names(context)
+
+    # Store message details and initialize empty selection
     context.user_data['msg_id'] = update.message.message_id
     context.user_data['chat_id'] = update.effective_chat.id
+    context.user_data['selected_channels'] = set()
 
-    # Create keyboard for channel selection
-    keyboard = []
-    for i, ch in enumerate(CHANNELS, 1):
-        keyboard.append([InlineKeyboardButton(f"قناة {i} ({ch})", callback_data=f"select_channel_{ch}")])
-    
-    # Option for all channels if there's more than one
-    if len(CHANNELS) > 1:
-        keyboard.append([InlineKeyboardButton("📢 كل القنوات", callback_data="select_channel_all")])
-        
-    keyboard.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    reply_markup = _build_keyboard(context)
     await update.message.reply_text(
-        "اختر القناة اللي عايز تنشر فيها الرسالة دي:",
+        "لوحة التحكم:\nاختر القنوات التي تريد نشر الرسالة فيها:",
         reply_markup=reply_markup,
         reply_to_message_id=update.message.message_id
     )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update): return
     query = update.callback_query
-    if query.from_user.id != YOUR_USER_ID:
-        await query.answer("❌ مش مصرح لك.", show_alert=True)
-        return
-
     await query.answer()
     data = query.data
 
     if data == "cancel":
-        await query.edit_message_text("تم الإلغاء ❌")
+        await query.edit_message_text("تم الإلغاء وحذف العملية. ❌")
         context.user_data.clear()
         return
 
-    if data.startswith("select_channel_"):
-        channel = data.split("_")[2]
-        context.user_data['selected_channel'] = channel
+    if data.startswith("toggle_"):
+        ch = int(data.split("_")[1])
+        selected = context.user_data.get('selected_channels', set())
+        if ch in selected:
+            selected.remove(ch)
+        else:
+            selected.add(ch)
+        context.user_data['selected_channels'] = selected
         
-        # Ask for confirmation
-        channel_name = "كل القنوات" if channel == "all" else f"القناة ({channel})"
-        keyboard = [
-            [InlineKeyboardButton("✅ نعم، انشر الآن", callback_data="confirm_post")],
-            [InlineKeyboardButton("❌ لا، إلغاء", callback_data="cancel")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            f"⚠️ تأكيد النشر:\nهل أنت متأكد أنك تريد النشر في {channel_name}؟",
-            reply_markup=reply_markup
-        )
+        await query.edit_message_reply_markup(reply_markup=_build_keyboard(context))
+        return
+
+    if data == "select_all":
+        context.user_data['selected_channels'] = set(CHANNELS)
+        await query.edit_message_reply_markup(reply_markup=_build_keyboard(context))
+        return
+
+    if data == "deselect_all":
+        context.user_data['selected_channels'] = set()
+        await query.edit_message_reply_markup(reply_markup=_build_keyboard(context))
         return
 
     if data == "confirm_post":
         msg_id = context.user_data.get('msg_id')
         from_chat_id = context.user_data.get('chat_id')
-        channel = context.user_data.get('selected_channel')
+        target_channels = context.user_data.get('selected_channels', set())
 
-        if not msg_id or not from_chat_id or not channel:
-            await query.edit_message_text("❌ حدث خطأ، لم أتمكن من العثور على الرسالة الأصلية.")
+        if not msg_id or not from_chat_id or not target_channels:
+            await query.edit_message_text("❌ حدث خطأ أو لم يتم تحديد قنوات.")
             return
 
-        target_channels = CHANNELS if channel == "all" else [int(channel)]
-        
         success = 0
         failed = 0
         failed_channels = []
+        names = context.bot_data.get('channel_names', {})
 
         await query.edit_message_text("جاري النشر... ⏳")
 
@@ -120,7 +166,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 success += 1
             except Exception as e:
                 failed += 1
-                failed_channels.append(str(channel_id))
+                ch_name = names.get(channel_id, str(channel_id))
+                failed_channels.append(ch_name)
                 logging.error(f"فشل النشر في {channel_id}: {e}")
 
         report = f"✅ تم النشر بنجاح في {success} قناة."
